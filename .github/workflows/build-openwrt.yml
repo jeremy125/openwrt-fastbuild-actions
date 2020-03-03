@@ -16,8 +16,12 @@
 # If you want to tweak the options, please be sure you understand them.
 # 如果你想更改参数，确保在理解它们的前提下进行
 env:
-  # Specify here the name and tag you want to use for the builders
-  # 在这里自定义你想使用的Builder名和默认Tag
+  # Specify here the name and tag you want to use for the builders, they will be used for your docker hub repository
+  # For BUILDER_NAME: due to docker's limitation, only allowing lowercase letters, digits and separators (period, underscores, dashes)
+  # For BUILDER_TAG: lowercase and uppercase letters, digits, underscores, periods and dashes
+  # 在这里自定义你想使用的Builder名和默认Tag，这将被用作Docker Hub仓库的名字和Tag
+  # 对于BUILDER_NAME，由于docker的限制，仅能使用小写字母、数字和分隔符（英文句号，下划线，横杠）
+  # 对于BUILDER_TAG，能使用大小写字母、数字和分隔符
   BUILDER_NAME: openwrt
   BUILDER_TAG: latest
   # Specify here the OpenWrt Repo URL and Branch
@@ -37,15 +41,18 @@ env:
   DK_USERNAME: ${{secrets.docker_username}}
   DK_PASSWORD: ${{secrets.docker_password}}
   SLACK_WEBHOOK_URL: ${{secrets.SLACK_WEBHOOK_URL}}
+  TMATE_ENCRYPT_PASSWORD: ${{secrets.TMATE_ENCRYPT_PASSWORD}}
   # Not recommended to change unless you understand how it is used
   # 以下参数不推荐修改
   DK_BUILDX_DRIVER: docker
   DK_CONTEXT: .
   DK_NO_REMOTE_CACHE: 1
   DK_NO_BUILDTIME_PUSH: 1
+  DK_CONVERT_MULTISTAGE_TO_IMAGE: 1
   DOCKERFILE_BASE: Dockerfile
   DOCKERFILE_INC: Dockerfile-inc
   DOCKERFILE_PACKAGE: Dockerfile-package
+  CONFIG_FILE_DEFAULT: 'config.diff.default'
 
 name: Build OpenWrt
 
@@ -56,6 +63,7 @@ on:
     paths-ignore:
     - imgs
     - README.md
+    - README_CN.md
     - LICENSE
     - .dockerignore
   ## If you want to use 'watch', 'schedule' events, make sure you also have changed the jobs' `if` condition.
@@ -130,6 +138,13 @@ jobs:
         echo "::set-env name=DK_IMAGE_NAME::${BUILDER_NAME}"
         echo "::set-env name=DK_IMAGE_TAG::${BUILDER_TAG_INC}"
 
+        if [ -z "${CONFIG_FILE}" -o ! -f "${CONFIG_FILE}" ]; then
+          echo "CONFIG_FILE='${CONFIG_FILE}' does not exist, using default" >&2
+          [ ! -z "${CONFIG_FILE_DEFAULT}" -a -f "${CONFIG_FILE_DEFAULT}" ] || ( echo "CONFIG_FILE_DEFAULT='${CONFIG_FILE_DEFAULT}' does not exist!" >&2 && exit 1 )
+          export CONFIG_FILE="${CONFIG_FILE_DEFAULT}"
+          echo "::set-env name=CONFIG_FILE::${CONFIG_FILE}"
+        fi
+
         for var_dockerfile in ${!DOCKERFILE_@}; do
           eval ${var_dockerfile}="Dockerfiles/${!var_dockerfile}"
           echo "::set-env name=${var_dockerfile}::${!var_dockerfile}"
@@ -159,7 +174,13 @@ jobs:
         [ "x${{ (github.event_name == 'push' && contains(github.event.head_commit.message, '#push_when_fail#')) || github.event.client_payload.push_when_fail || github.event.deployment.payload.push_when_fail }}" != "xtrue" ] || OPT_PUSH_WHEN_FAIL=1
         echo "::set-env name=OPT_PUSH_WHEN_FAIL::${OPT_PUSH_WHEN_FAIL}"
 
-        scripts/cleanup.sh
+        if [ "x${OPT_DEBUG}" = "x1" -a -z "${TMATE_ENCRYPT_PASSWORD}" -a -z "${SLACK_WEBHOOK_URL}" ]; then
+          echo "::error::To use debug mode, you should set either TMATE_ENCRYPT_PASSWORD or SLACK_WEBHOOK_URL in the 'Secrets' page for safety of your sensitive information. For details, please refer to https://github.com/tete103%30/debugger-action/blob/master/README.md"
+          echo "::error::In the reference URL you are instructed to use environment variables for them. However in this repo, you should set them in the 'Secrets' page"
+          exit 1
+        fi
+
+        [ "x${TEST}" = "x1" ] || scripts/cleanup.sh
 
     - name: Set up Docker Buildx
       id: buildx
@@ -222,11 +243,12 @@ jobs:
         build_image clone
 
     # Allow intermediate customization
-    - name: Debug set, wait for SSH connection
+    - name: Debug set, wait for SSH connection (timeout 5min)
       if: env.OPT_DEBUG == '1'
       env:
         TIMEOUT_MIN: 5
-      uses: tete1030/debugger-action@my
+        TMATE_DOCKER_IMAGE: ${{env.DK_LAST_BUILD_TARGET}}
+      uses: tete1030/debugger-action@master
 
     - name: Apply customizations
       run: |
@@ -253,7 +275,7 @@ jobs:
       if: |
         !cancelled() && (
           success()
-          || env.PUSH_WHEN_FAIL == '1'
+          || env.OPT_PUSH_WHEN_FAIL == '1'
         )
       run: |
         . docker.sh
@@ -297,11 +319,22 @@ jobs:
         path: ${{ env.FIRMWARE }}
 
     # failure checking
-    - name: Failed/debug set, wait for SSH connection ( you are safe to cancel the job now )
+    - name: Failed/debug set, wait for SSH connection (timeout 30min. You are safe to cancel the job now.)
       if: |
         failure()
         || env.OPT_DEBUG == '1'
-      uses: tete1030/debugger-action@my
+      env:
+        TMATE_DOCKER_IMAGE: ${{env.DK_LAST_BUILD_TARGET}}
+      uses: tete1030/debugger-action@master
+    
+    - name: Upload debugging changes
+      if: |
+        (failure() && env.OPT_PUSH_WHEN_FAIL == '1')
+        || env.OPT_DEBUG == '1'
+      run: |
+        . docker.sh
+        docker tag "${DK_LAST_BUILD_TARGET}" "$(_get_full_image_name_tag_for_build)"
+        push_image_and_cache
 
   build-package:
     runs-on: ubuntu-18.04
@@ -365,6 +398,13 @@ jobs:
         echo "::set-env name=DK_IMAGE_NAME::${BUILDER_NAME}"
         echo "::set-env name=DK_IMAGE_TAG::${BUILDER_TAG_PACKAGE}"
 
+        if [ -z "${CONFIG_FILE}" -o ! -f "${CONFIG_FILE}" ]; then
+          echo "CONFIG_FILE='${CONFIG_FILE}' does not exist, using default" >&2
+          [ ! -z "${CONFIG_FILE_DEFAULT}" -a -f "${CONFIG_FILE_DEFAULT}" ] || ( echo "CONFIG_FILE_DEFAULT='${CONFIG_FILE_DEFAULT}' does not exist!" >&2 && exit 1 )
+          export CONFIG_FILE="${CONFIG_FILE_DEFAULT}"
+          echo "::set-env name=CONFIG_FILE::${CONFIG_FILE}"
+        fi
+
         for var_dockerfile in ${!DOCKERFILE_@}; do
           eval ${var_dockerfile}="Dockerfiles/${!var_dockerfile}"
           echo "::set-env name=${var_dockerfile}::${!var_dockerfile}"
@@ -391,7 +431,13 @@ jobs:
         [ "x${{ (github.event_name == 'push' && contains(github.event.head_commit.message, '#push_when_fail#')) || github.event.client_payload.push_when_fail || github.event.deployment.payload.push_when_fail }}" != "xtrue" ] || OPT_PUSH_WHEN_FAIL=1
         echo "::set-env name=OPT_PUSH_WHEN_FAIL::${OPT_PUSH_WHEN_FAIL}"
 
-        scripts/cleanup.sh
+        if [ "x${OPT_DEBUG}" = "x1" -a -z "${TMATE_ENCRYPT_PASSWORD}" -a -z "${SLACK_WEBHOOK_URL}" ]; then
+          echo "::error::To use debug mode, you should set either TMATE_ENCRYPT_PASSWORD or SLACK_WEBHOOK_URL in the 'Secrets' page for safety of your sensitive information. For details, please refer to https://github.com/tete103%30/debugger-action/blob/master/README.md"
+          echo "::error::In the reference URL you are instructed to use environment variables for them. However in this repo, you should set them in the 'Secrets' page"
+          exit 1
+        fi
+
+        [ "x${TEST}" = "x1" ] || scripts/cleanup.sh
 
     - name: Set up Docker Buildx
       id: buildx
@@ -443,11 +489,12 @@ jobs:
         pull_image
 
     # Allow intermediate customization
-    - name: Debug set, wait for SSH connection
+    - name: Debug set, wait for SSH connection (timeout 5min)
       if: env.OPT_DEBUG == '1'
       env:
         TIMEOUT_MIN: 5
-      uses: tete1030/debugger-action@my
+        TMATE_DOCKER_IMAGE: ${{env.DK_LAST_BUILD_TARGET}}
+      uses: tete1030/debugger-action@master
 
     - name: Update repo and packages
       run: |
@@ -525,9 +572,20 @@ jobs:
         path: openwrt/bin
 
     # failure checking
-    - name: Failed/debug set, wait for SSH connection ( you are safe to cancel the job now )
+    - name: Failed/debug set, wait for SSH connection (timeout 30min. You are safe to cancel the job now.)
       if: failure() || env.OPT_DEBUG == '1'
-      uses: tete1030/debugger-action@my
+      env:
+        TMATE_DOCKER_IMAGE: ${{env.DK_LAST_BUILD_TARGET}}
+      uses: tete1030/debugger-action@master
+    
+    - name: Upload debugging changes
+      if: |
+        (failure() && env.OPT_PUSH_WHEN_FAIL == '1')
+        || env.OPT_DEBUG == '1'
+      run: |
+        . docker.sh
+        docker tag "${DK_LAST_BUILD_TARGET}" "$(_get_full_image_name_tag_for_build)"
+        push_image_and_cache
 
   build-direct:
     runs-on: ubuntu-18.04
@@ -571,11 +629,11 @@ jobs:
       run: scripts/customize.sh
 
     # Allow intermediate customization
-    - name: Debug set, wait for SSH connection
+    - name: Debug set, wait for SSH connection (timeout 5min)
       if: env.OPT_DEBUG == '1'
       env:
         TIMEOUT_MIN: 5
-      uses: tete1030/debugger-action@my
+      uses: tete1030/debugger-action@master
 
     - name: Download packages
       run: scripts/download.sh
@@ -623,6 +681,6 @@ jobs:
         path: ${{ env.FIRMWARE }}
 
     # failure checking
-    - name: Failed/debug set, wait for SSH connection ( you are safe to cancel the job now )
+    - name: Failed/debug set, wait for SSH connection (timeout 30min. You are safe to cancel the job now.)
       if: failure() || env.OPT_DEBUG == '1'
-      uses: tete1030/debugger-action@my
+      uses: tete1030/debugger-action@master
